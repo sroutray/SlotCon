@@ -132,6 +132,8 @@ class SlotCon(nn.Module):
         self.K = int(args.num_instances * 1. / args.world_size / args.batch_size * args.epochs)
         self.k = int(args.num_instances * 1. / args.world_size / args.batch_size * (args.start_epoch - 1))
 
+        self.wandb_logger = args.wandb_logger
+
     def re_init(self, args):
         self.k = int(args.num_instances * 1. / args.world_size / args.batch_size * (args.start_epoch - 1))
 
@@ -199,13 +201,19 @@ class SlotCon(nn.Module):
             (k1, score_k1), (k2, score_k2) = self.grouping_k(y1), self.grouping_k(y2)
             k1_aligned, k2_aligned = self.invaug(score_k1, coords[0], flags[0]), self.invaug(score_k2, coords[1], flags[1])
         
-        loss = self.group_loss_weight * self.self_distill(q1_aligned.permute(0, 2, 3, 1).flatten(0, 2), k2_aligned.permute(0, 2, 3, 1).flatten(0, 2)) \
-             + self.group_loss_weight * self.self_distill(q2_aligned.permute(0, 2, 3, 1).flatten(0, 2), k1_aligned.permute(0, 2, 3, 1).flatten(0, 2))
+        distill_loss = self.self_distill(q1_aligned.permute(0, 2, 3, 1).flatten(0, 2), k2_aligned.permute(0, 2, 3, 1).flatten(0, 2)) \
+             + self.self_distill(q2_aligned.permute(0, 2, 3, 1).flatten(0, 2), k1_aligned.permute(0, 2, 3, 1).flatten(0, 2))
+        loss = self.group_loss_weight * distill_loss
 
         self.update_center(torch.cat([score_k1, score_k2]).permute(0, 2, 3, 1).flatten(0, 2))
 
-        loss += (1. - self.group_loss_weight) * self.ctr_loss_filtered(q1, k2, score_q1, score_k2) \
-              + (1. - self.group_loss_weight) * self.ctr_loss_filtered(q2, k1, score_q2, score_k1)
+        slot_loss = self.ctr_loss_filtered(q1, k2, score_q1, score_k2) \
+              + self.ctr_loss_filtered(q2, k1, score_q2, score_k1)
+        loss += (1. - self.group_loss_weight) * slot_loss
+
+        if self.wandb_logger:
+            self.wandb_logger.log({"distill_loss": distill_loss.item()})
+            self.wandb_logger.log({"slot_loss": slot_loss.item()})
         
         return loss
     

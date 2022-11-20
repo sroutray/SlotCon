@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+import wandb
 
 from data.datasets import ImageFolder
 from data.transforms import CustomDataAugmentation
@@ -64,6 +65,7 @@ def get_parser():
     parser.add_argument('--save-freq', type=int, default=50, help='save frequency')
     parser.add_argument('--seed', type=int, help='Random seed.')
     parser.add_argument('--num-workers', type=int, default=8, help='num of workers per GPU to use')
+    parser.add_argument('--wandb-logging', action='store_true', help='log train metrics on wandb')
 
     args = parser.parse_args()
     if os.environ["LOCAL_RANK"] is not None:
@@ -94,7 +96,7 @@ def build_model(args):
     return model, optimizer
 
 
-def save_checkpoint(args, epoch, model, optimizer, scheduler, scaler=None):
+def save_checkpoint(args, epoch, model, optimizer, scheduler, scaler=None, current_only=False):
     logger.info('==> Saving...')
     state = {
         'args': args,
@@ -105,9 +107,12 @@ def save_checkpoint(args, epoch, model, optimizer, scheduler, scaler=None):
     }
     if args.fp16:
         state['scaler'] = scaler.state_dict()
-    file_name = os.path.join(args.output_dir, f'ckpt_epoch_{epoch}.pth')
+    if current_only:
+        file_name = os.path.join(args.output_dir, 'current.pt')
+    else:
+        file_name = os.path.join(args.output_dir, f'ckpt_epoch_{epoch}.pt')
     torch.save(state, file_name)
-    shutil.copyfile(file_name, os.path.join(args.output_dir, 'current.pth'))
+    # shutil.copyfile(file_name, os.path.join(args.output_dir, 'current.pth'))
 
 def load_checkpoint(args, model, optimizer, scheduler, scaler=None):
     if os.path.isfile(args.resume):
@@ -162,7 +167,7 @@ def main(args):
 
     # optionally resume from a checkpoint
     if args.auto_resume:
-        resume_file = os.path.join(args.output_dir, "current.pth")
+        resume_file = os.path.join(args.output_dir, "current.pt")
         if os.path.exists(resume_file):
             logger.info(f'auto resume from {resume_file}')
             args.resume = resume_file
@@ -177,6 +182,7 @@ def main(args):
         # train for one epoch
         train(train_loader, model, optimizer, scaler, scheduler, epoch, args)
 
+        save_checkpoint(args, epoch, model, optimizer, scheduler, scaler, current_only=True)
         if dist.get_rank() == 0 and (epoch % args.save_freq == 0 or epoch == args.epochs):
             save_checkpoint(args, epoch, model, optimizer, scheduler, scaler)
 
@@ -184,6 +190,7 @@ def main(args):
 def train(train_loader, model, optimizer, scaler, scheduler, epoch, args):
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
+    wandb_logger = args.wandb_logger
     # switch to train mode
     model.train()
 
@@ -212,12 +219,15 @@ def train(train_loader, model, optimizer, scaler, scheduler, epoch, args):
 
         # avg loss from batch size
         loss_meter.update(loss.item(), crops[0].size(0))
+        lr = optimizer.param_groups[0]['lr']
+        if wandb_logger:
+            wandb_logger.log({"total_loss": loss.item()})
+            wandb_logger.log({"lr": float(lr)})
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
         if i % args.print_freq == 0:
-            lr = optimizer.param_groups[0]['lr']
             etas = batch_time.avg * (train_len - i)
             logger.info(
                 f'Train: [{epoch}/{args.epochs}][{i}/{train_len}]  '
@@ -240,11 +250,18 @@ if __name__ == '__main__':
     os.makedirs(args.output_dir, exist_ok=True)
     logger = setup_logger(output=args.output_dir,
                           distributed_rank=dist.get_rank(), name="slotcon")
+    
+    wandb_logger = None
     if dist.get_rank() == 0:
         path = os.path.join(args.output_dir, "config.json")
         with open(path, 'w') as f:
             json.dump(vars(args), f, indent=2)
         logger.info("Full config saved to {}".format(path))
+        if args.wandb_logging:
+            wandb_logger = wandb.init(project="dense-rep-learning", entity="self-sup-rep")
+            wandb_logger.name = args.output_dir.split("/")[-1]
+            wandb_logger.config.update(args)
+    args.wandb_logger = wandb_logger
 
     # print args
     logger.info(
