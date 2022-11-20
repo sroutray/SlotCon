@@ -117,6 +117,7 @@ class SlotCon(nn.Module):
         nn.SyncBatchNorm.convert_sync_batchnorm(self.projector_k)
 
         self.num_prototypes = args.num_prototypes
+        self.no_center = args.no_center
         self.center_momentum = args.center_momentum
         self.register_buffer("center", torch.zeros(1, self.num_prototypes))
         self.grouping_q = SemanticGrouping(self.num_prototypes, self.dim_out, self.teacher_temp)
@@ -172,7 +173,10 @@ class SlotCon(nn.Module):
 
     def self_distill(self, q, k):
         q = F.log_softmax(q / self.student_temp, dim=-1)
-        k = F.softmax((k - self.center) / self.teacher_temp, dim=-1)
+        if self.no_center:
+            k = F.softmax(k/ self.teacher_temp, dim=-1)
+        else:
+            k = F.softmax((k - self.center) / self.teacher_temp, dim=-1)
         return torch.sum(-k * q, dim=-1).mean()
 
     def ctr_loss_filtered(self, q, k, score_q, score_k, tau=0.2):

@@ -5,10 +5,10 @@ set -e
 set -x
 
 data_dir="/scratch/gobi3/chaenayo/coco/images"
-output_dir="./output/slotcon_coco_baseline_1gpu_800ep_no_predictor"
+output_dir="./output/slotcon_coco_baseline_1gpu_800ep_no_predictor_no_center"
 
 CUDA_VISIBLE_DEVICES=0 torchrun --master_port 12348 --nproc_per_node=1 \
-    main_pretrain_no_predictor.py \
+    main_pretrain_no_predictor_no_center.py \
     --dataset COCO \
     --data-dir ${data_dir} \
     --output-dir ${output_dir} \
@@ -21,6 +21,7 @@ CUDA_VISIBLE_DEVICES=0 torchrun --master_port 12348 --nproc_per_node=1 \
     --teacher-temp 0.07 \
     --group-loss-weight 0.5 \
     --no-predictor \
+    --no-center \
     \
     --batch-size 80 \
     --optimizer lars \
