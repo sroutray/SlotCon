@@ -121,7 +121,11 @@ class SlotCon(nn.Module):
         self.register_buffer("center", torch.zeros(1, self.num_prototypes))
         self.grouping_q = SemanticGrouping(self.num_prototypes, self.dim_out, self.teacher_temp)
         self.grouping_k = SemanticGrouping(self.num_prototypes, self.dim_out, self.teacher_temp)
-        self.predictor_slot = DINOHead(self.dim_out, hidden_dim=self.dim_hidden, bottleneck_dim=self.dim_out)
+        self.no_predictor = args.no_predictor
+        if self.no_predictor:
+            self.predictor_slot = nn.Identity()
+        else:
+            self.predictor_slot = DINOHead(self.dim_out, hidden_dim=self.dim_hidden, bottleneck_dim=self.dim_out)
 
         nn.SyncBatchNorm.convert_sync_batchnorm(self.predictor_slot)
             

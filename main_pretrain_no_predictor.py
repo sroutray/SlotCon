@@ -16,7 +16,7 @@ from data.datasets import ImageFolder
 from data.transforms import CustomDataAugmentation
 
 from models import resnet
-from models.slotcon import SlotCon
+from models.slotcon_no_predictor import SlotCon
 from utils.lars import LARS
 from utils.logger import setup_logger
 from utils.lr_scheduler import get_scheduler
@@ -43,6 +43,7 @@ def get_parser():
     parser.add_argument('--student-temp', default=0.1, type=float, help='student temperature')
     parser.add_argument('--center-momentum', default=0.9, type=float, help='momentum for the center')
     parser.add_argument('--group-loss-weight', default=0.5, type=float, help='balancing weight of the grouping loss')
+    parser.add_argument('--no-predictor', action='store_true', help='replace predictor with identity layer')
 
     # optim.
     parser.add_argument('--batch-size', type=int, default=512, help='total batch size')
