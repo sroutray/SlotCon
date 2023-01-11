@@ -29,6 +29,7 @@ def get_color_arr(args, color_map):
         col = color_map(p)[:-1]
         color_arr.append(col)
     color_arr = torch.FloatTensor(color_arr)
+    return color_arr
 
 
 def denorm(img):
@@ -48,7 +49,8 @@ def get_model(args):
     model = SlotConEval(encoder, args)
     checkpoint = torch.load(args.model_path, map_location='cpu')
     weights = {k.replace('module.', ''):v for k, v in checkpoint['model'].items()}
-    model.load_state_dict(weights, strict=False)
+    msg = model.load_state_dict(weights, strict=False)
+    print(msg)
     model = model.eval()
     return model
 
@@ -92,34 +94,40 @@ def viz_knn(dataset, dots, idxs, slot_idxs, color_arr, args):
     os.makedirs(os.path.join(args.save_path, f"masked_imgs"), exist_ok=True)
     os.makedirs(os.path.join(args.save_path, f"full_assgn_imgs"), exist_ok=True)
     
+    coverage_avgs = []
     for i, slot_idx in enumerate(tqdm(slot_idxs, desc='KNN retreiving', leave=False, disable=False)):
         proto_color = color_arr[slot_idx]
         proto_color = proto_color.reshape(3, 1, 1)
-        torchvision.utils.save_image(proto_color.expand_dims(-1, 14, 14), os.path.join(args.save_path, f"proto_imgs/{slot_idx:03d}.png"))
+        torchvision.utils.save_image(proto_color.expand(-1, 14, 14), os.path.join(args.save_path, f"proto_imgs/{slot_idx:03d}.png"))
         top_masked_imgs = []
         full_assgn_imgs = []
+        coverage_counts = []
         for j in range(args.topk):
             idx = idxs[slot_idx, j]
             image = denorm_tensor(dataset[idx])
-            pred = transforms.functional.resize(dots[idx], image.shape[:2], TF.InterpolationMode.BILINEAR)
+            # import ipdb; ipdb.set_trace()
+            pred = F.interpolate(dots[idx].unsqueeze(0), size=image.shape[-2:], mode="bilinear")[0]
+            # pred = transforms.functional.resize(dots[idx], image.shape[-2:], TF.InterpolationMode.BILINEAR)
             mask = torch.zeros_like(pred).scatter_(0, pred.argmax(0, keepdim=True), 1)
-            mask = mask[slot_idx].unsqueeze(-1).cpu()
+            mask = mask[slot_idx].unsqueeze(0).cpu()
             image = (args.alpha * (image * mask) + (1 - args.alpha) * proto_color * mask) + (image * (1 - mask))
             assgn = (pred / args.temp).softmax(dim=0)
             # assgn = (pred**3 / args.temp).softmax(dim=0)
-            assgn_c = torch.einsum("khw,kc->chw", assgn, color_arr)            
+            assgn_c = torch.einsum("khw,kc->chw", assgn.cpu(), color_arr)            
             top_masked_imgs.append(image)
-            full_assgn_imgs.append(assgn)
+            full_assgn_imgs.append(assgn_c)
+            coverage_counts.append(mask.sum())
 
         top_masked_grid = torchvision.utils.make_grid(top_masked_imgs, nrow=int(args.topk/2))
         full_assgn_grid = torchvision.utils.make_grid(full_assgn_imgs, nrow=int(args.topk/2))
         torchvision.utils.save_image(top_masked_grid, os.path.join(args.save_path, f"masked_imgs/{slot_idx:03d}.png"))
         torchvision.utils.save_image(full_assgn_grid, os.path.join(args.save_path, f"full_assgn_imgs/{slot_idx:03d}.png"))
+        coverage_avgs.append(np.array(coverage_counts).mean())
     
-    create_html(args.save_path, args.mode)
+    create_html(args.save_path, args.mode, coverage_avgs)
 
 
-def create_html(root, mode):
+def create_html(root, mode, coverage_avgs):
     anchor_dir = os.path.join(root, "proto_imgs")
     img_names = sorted(os.listdir(anchor_dir))
     with document(title=f"Images and Features Viz ({mode})") as doc:
@@ -141,11 +149,11 @@ def create_html(root, mode):
                 }
                 """
             )
-            for im in img_names:
+            for i, im in enumerate(img_names):
                 htags.h1(f"Prototype ID {im[:-4]}")
                 htags.h2(f"Prototype Color {im[:-4]}")
                 htags.div(htags.img(src=f"proto_imgs/{im}", _class="center-fit"), _class="imgbox")
-                htags.h2(f"Prototype Masked Image {im[:-4]}")
+                htags.h2(f"Prototype Masked Image {im[:-4]}    Coverage Average {coverage_avgs[i]}")
                 htags.div(htags.img(src=f"masked_imgs/{im}", _class="center-fit"), _class="imgbox")
                 htags.h2(f"Assignment Image {im[:-4]}")
                 htags.div(htags.img(src=f"full_assgn_imgs/{im}", _class="center-fit"), _class="imgbox")
@@ -174,6 +182,7 @@ if __name__=='__main__':
     parser.add_argument('--dim_out', type=int, default=256)
     parser.add_argument('--arch', type=str, default='resnet50')
     parser.add_argument('--num_prototypes', type=int, default=256)
+    parser.add_argument('--temp', default=0.07, type=float)
     args = parser.parse_args()
 
     mean_vals, std_vals = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
@@ -183,10 +192,10 @@ if __name__=='__main__':
     model = get_model(args).cuda()
 
     if args.mode == "knn":
-        args.save_path = args.save_path + "_knn"
+        args.save_path = os.path.join(args.save_path, "knn")
         dots, idxs = prepare_knn(model, dataset, args)
     elif args.mode == "topk_counts":
-        args.save_path = args.save_path + "_topk_counts"
+        args.save_path = os.path.join(args.save_path, "topk_counts")
         dots, idxs = prepare_ktop_counts(model, dataset, args)
     else:
         raise NotImplementedError()
