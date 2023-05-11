@@ -23,7 +23,7 @@ class LeopartEval(torch.nn.Module):
         super().__init__()
         # Init Model
         self.patch_size = args.patch_size
-        spatial_res = 224 / args.patch_size
+        spatial_res = args.img_size / args.patch_size
         assert spatial_res.is_integer()
         self.spatial_res = int(spatial_res)
         self.num_prototypes = args.num_prototypes
@@ -91,8 +91,8 @@ def get_model(args):
     model = LeopartEval(args)
     checkpoint = torch.load(args.model_path, map_location='cpu')
     weights = checkpoint["state_dict"]
-    model_weights = {k.replace("teacher", "model"):v for k, v in weights.items() if k.startswith("teacher")}
-    # model_weights = {k:v for k, v in weights.items() if k.startswith("model")}
+    # model_weights = {k.replace("teacher", "model"):v for k, v in weights.items() if k.startswith("teacher")}
+    model_weights = {k:v for k, v in weights.items() if k.startswith("model")}
     msg = model.load_state_dict(model_weights, strict=False)
     print(msg)
     model = model.eval()
@@ -105,7 +105,8 @@ def get_features(model, data_loader):
     mask_bank = []
     for data in tqdm(data_loader, desc='Feature extracting', leave=False, disable=False):
         img, mask = data
-        mask = mask.cuda(non_blocking=True)
+        mask *= 255
+        mask = mask.long()
         feature = model(img.cuda(non_blocking=True)) #.mean(dim=(-2, -1))
         # feature = F.normalize(feature, dim=1)
         feature_bank.append(feature)
@@ -117,14 +118,18 @@ def get_features(model, data_loader):
 
 def prepare_knn(model, data_loader, args):
     # prototypes = F.normalize(model.model.prototypes.weight, dim=1) # k x d
-    feature_bank, mask_bank = get_features(model, data_loader, args.batch_size) # n x d x h x w
-    masks_adder = mask_bank.flatten(2, 3) + 1.e-6
-    masks_freq = masks_adder.sum(-1)
+    feature_bank, mask_bank = get_features(model, data_loader) # n x d x h x w
+    mask_bank[mask_bank == 255] = args.num_classes
+    mask_bank_one_hot = F.one_hot(mask_bank.squeeze_(), args.num_classes+1).permute(0, 3, 1, 2)
+    del mask_bank
+    masks_adder = mask_bank_one_hot.flatten(2, 3)
+    masks_freq = masks_adder.sum(-1) / (255)
     cov = torch.cov(masks_freq.T)
-    l = 0.01
-    cov_inv = torch.inverse(cov + l*torch.eye(args.num_prototypes).to(masks_freq.device))
+    l = 0.1
+    cov_inv = torch.inverse(cov + l*torch.eye(args.num_classes+1).to(masks_freq.device))
     scores = (masks_freq @ cov_inv) @ (masks_freq.T)
     _, idxs = scores.t().topk(dim=1, k=args.topk)
+    del mask_bank_one_hot, masks_freq
     return feature_bank, idxs
 
 
@@ -140,40 +145,50 @@ def prepare_ktop_counts(model, dataset, args):
 
 # TODO: Fix this!!
 def viz_knn(dataset, feats, idxs, plot_idxs, color_arr, args):    
-    os.makedirs(os.path.join(args.save_path, f"masked_imgs"), exist_ok=True)
-    os.makedirs(os.path.join(args.save_path, f"full_assgn_imgs"), exist_ok=True)
+    os.makedirs(os.path.join(args.save_path, f"fg_masks"), exist_ok=True)
+    os.makedirs(os.path.join(args.save_path, f"imgs"), exist_ok=True)
+    os.makedirs(os.path.join(args.save_path, f"gts"), exist_ok=True)
     
     coverage_avgs = []
     for i, plot_idx in enumerate(tqdm(plot_idxs, desc='Mining retreiving', leave=False, disable=False)):
-        top_masked_imgs = []
-        full_assgn_imgs = []
-        coverage_counts = []
-        for j in range(args.topk):
-            idx = idxs[plot_idx, j]
+        gts = []
+        top_imgs = []
+        fg_masks = []
+        for j in range(args.topk + 1):
+            if j == 0:
+                idx = plot_idx
+            else:
+                idx = idxs[plot_idx, j-1]
             image, gt = dataset[idx]
             image = denorm_tensor(image)
             # import ipdb; ipdb.set_trace()
-            feat = F.interpolate(feats[idx].unsqueeze(0), size=image.shape[-2:], mode="bilinear")[0]
+            feat = F.interpolate(feats[idx].unsqueeze(0).cpu(), size=image.shape[-2:], mode="bilinear")[0]
             assert feat.shape[-2:] == gt.shape[-2:]
             # TODO: PCA1
-            # pred = transforms.functional.resize(dots[idx], image.shape[-2:], TF.InterpolationMode.BILINEAR)
-            mask = torch.zeros_like(pred).scatter_(0, pred.argmax(0, keepdim=True), 1)
-            mask = mask[slot_idx].unsqueeze(0).cpu()
-            image = (args.alpha * (image * mask) + (1 - args.alpha) * proto_color * mask) + (image * (1 - mask))
-            assgn = (pred / args.temp).softmax(dim=0)
-            # assgn = (pred**3 / args.temp).softmax(dim=0)
-            assgn_c = torch.einsum("khw,kc->chw", assgn.cpu(), color_arr)            
-            top_masked_imgs.append(image)
-            full_assgn_imgs.append(assgn_c)
-            coverage_counts.append(mask.sum())
+            feat_centered = feat.permute(1,2,0).flatten(0,1)
+            feat_mean = torch.mean(feat_centered, 0, keepdim=True)
+            feat_std = torch.std(feat_centered, 0, keepdim=True)
+            feat_centered = (feat_centered - feat_mean) / feat_std
+            mat = faiss.PCAMatrix(feat_centered.size(1), feat_centered.size(1))
+            feat_centered = np.ascontiguousarray(feat_centered.numpy())
+            mat.train(feat_centered)
+            feat_tr = mat.apply(feat_centered)[:, 0]  # first PC
+            # import ipdb; ipdb.set_trace()
+            fg_mask = torch.tensor(feat_tr > 0).float().reshape(image.shape[-2], image.shape[-1])
+            top_imgs.append(image)
+            fg_masks.append(fg_mask.unsqueeze(0))
+            gts.append(gt)
 
-        top_masked_grid = torchvision.utils.make_grid(top_masked_imgs, nrow=int(args.topk/2))
-        full_assgn_grid = torchvision.utils.make_grid(full_assgn_imgs, nrow=int(args.topk/2))
-        torchvision.utils.save_image(top_masked_grid, os.path.join(args.save_path, f"masked_imgs/{slot_idx:03d}.png"))
-        torchvision.utils.save_image(full_assgn_grid, os.path.join(args.save_path, f"full_assgn_imgs/{slot_idx:03d}.png"))
-        coverage_avgs.append(np.array(coverage_counts).mean())
+
+        top_imgs_grid = torchvision.utils.make_grid(top_imgs, ncol=1)
+        fg_masks_grid = torchvision.utils.make_grid(fg_masks, ncol=1)
+        gts_grid = torchvision.utils.make_grid(gts, ncol=1)
+        torchvision.utils.save_image(top_imgs_grid, os.path.join(args.save_path, f"imgs/{plot_idx:03d}.png"))
+        torchvision.utils.save_image(fg_masks_grid, os.path.join(args.save_path, f"fg_masks/{plot_idx:03d}.png"))
+        torchvision.utils.save_image(gts_grid, os.path.join(args.save_path, f"gts/{plot_idx:03d}.png"))
+        # coverage_avgs.append(np.array(coverage_counts).mean())
     
-    create_html(args.save_path, args.mode, coverage_avgs)
+    # create_html(args.save_path, args.mode, coverage_avgs)
 
 
 def create_html(root, mode, coverage_avgs):
@@ -214,7 +229,7 @@ def create_html(root, mode, coverage_avgs):
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
     # viz-related
-    parser.add_argument('--topk', type=int, default=5)
+    parser.add_argument('--topk', type=int, default=4)
     parser.add_argument('--alpha', type=float, default=0.6)
     parser.add_argument('--dpi', type=int, default=100)
     parser.add_argument('--sampling', type=int, default=20)
@@ -222,9 +237,10 @@ if __name__=='__main__':
     parser.add_argument('--save_path', type=str, default='outputs')
     parser.add_argument('--mode', type=str, choices=["knn", "topk_counts"], default="knn")
     # dataset
-    parser.add_argument('--dataset', type=str, default='COCOval', help='dataset type')
+    parser.add_argument('--dataset_name', type=str, default='coco-thing', choices=["coco-thing", "coco-stuff"])
     parser.add_argument('--data_dir', type=str, default='./datasets/coco', help='dataset director')
     parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--img_size', type=int, default=256)
     # Model.
     parser.add_argument('--model_path', type=str)
     parser.add_argument('--arch', type=str, default='vit-small')
@@ -241,18 +257,31 @@ if __name__=='__main__':
     # transform = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(224), transforms.ToTensor(), transforms.Normalize(mean=mean_vals, std=std_vals)])
 
     train_transforms = None
+    # val_image_transforms = transforms.Compose(
+    #     [
+    #         transforms.Resize((256, 256)),
+    #         transforms.CenterCrop(224),
+    #         transforms.ToTensor(),
+    #         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    #     ]
+    # )
+    # val_target_transforms = transforms.Compose(
+    #     [
+    #         transforms.Resize((256, 256), interpolation=TF.InterpolationMode.NEAREST),
+    #         transforms.CenterCrop(224),
+    #         transforms.ToTensor(),
+    #     ]
+    # )
     val_image_transforms = transforms.Compose(
         [
-            transforms.Resize((256, 256)),
-            transforms.CenterCrop(224),
+            transforms.Resize((args.img_size, args.img_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
     val_target_transforms = transforms.Compose(
         [
-            transforms.Resize((256, 256), interpolation=TF.InterpolationMode.NEAREST),
-            transforms.CenterCrop(224),
+            transforms.Resize((args.img_size, args.img_size), interpolation=TF.InterpolationMode.NEAREST),
             transforms.ToTensor(),
         ]
     )
@@ -286,6 +315,7 @@ if __name__=='__main__':
     else:
         raise ValueError(f"{args.dataset_name} not supported")
     
+    data_module.setup()
     val_loader = data_module.val_dataloader()
     
     model = get_model(args).cuda()
