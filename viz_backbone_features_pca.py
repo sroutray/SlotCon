@@ -148,9 +148,12 @@ def viz_knn(dataset, feats, idxs, plot_idxs, color_arr, args):
     os.makedirs(os.path.join(args.save_path, f"fg_masks"), exist_ok=True)
     os.makedirs(os.path.join(args.save_path, f"imgs"), exist_ok=True)
     os.makedirs(os.path.join(args.save_path, f"gts"), exist_ok=True)
+    os.makedirs(os.path.join(args.save_path, f"pca3"), exist_ok=True)
     
     coverage_avgs = []
     for i, plot_idx in enumerate(tqdm(plot_idxs, desc='Mining retreiving', leave=False, disable=False)):
+        feat_list = []
+        pca3_mask_list = []
         gts = []
         top_imgs = []
         fg_masks = []
@@ -165,27 +168,38 @@ def viz_knn(dataset, feats, idxs, plot_idxs, color_arr, args):
             feat = F.interpolate(feats[idx].unsqueeze(0).cpu(), size=image.shape[-2:], mode="bilinear")[0]
             assert feat.shape[-2:] == gt.shape[-2:]
             # TODO: PCA1
-            feat_centered = feat.permute(1,2,0).flatten(0,1)
-            feat_mean = torch.mean(feat_centered, 0, keepdim=True)
-            feat_std = torch.std(feat_centered, 0, keepdim=True)
-            feat_centered = (feat_centered - feat_mean) / feat_std
-            mat = faiss.PCAMatrix(feat_centered.size(1), feat_centered.size(1))
-            feat_centered = np.ascontiguousarray(feat_centered.numpy())
-            mat.train(feat_centered)
-            feat_tr = mat.apply(feat_centered)[:, 0]  # first PC
+            # feat_centered = feat.permute(1,2,0).flatten(0,1)
+            # feat_mean = torch.mean(feat_centered, 0, keepdim=True)
+            # feat_std = torch.std(feat_centered, 0, keepdim=True)
+            # feat_centered = (feat_centered - feat_mean) / feat_std
+            # mat = faiss.PCAMatrix(feat_centered.size(1), feat_centered.size(1))
+            # feat_centered = np.ascontiguousarray(feat_centered.numpy())
+            # mat.train(feat_centered)
+            # feat_tr = mat.apply(feat_centered)[:, 0]  # first PC
             # import ipdb; ipdb.set_trace()
+            feat = feat.permute(1,2,0).flatten(0,1)
+            feat = np.ascontiguousarray(feat.numpy())
+            feat_tr, _ = compute_pca([feat], 1)
+            feat_tr = feat_tr[0][:, 0]
             fg_mask = torch.tensor(feat_tr > 0).float().reshape(image.shape[-2], image.shape[-1])
+            feat_list.append(feat)
+            pca3_mask_list.append((feat_tr > 0).long())
             top_imgs.append(image)
             fg_masks.append(fg_mask.unsqueeze(0))
             gts.append(gt)
 
 
+        # PCA2
+        pca3_list = compute_pca(feat_list, 3, pca3_mask_list)
+        pca3_img_list = [x.reshape(args.img_size[-2], args.img_size[-1], 3) for x in pca3_list]
+        pca3_img_grid = torchvision.utils.make_grid(pca3_img_list, ncol=1, normalize=True)
         top_imgs_grid = torchvision.utils.make_grid(top_imgs, ncol=1)
         fg_masks_grid = torchvision.utils.make_grid(fg_masks, ncol=1)
         gts_grid = torchvision.utils.make_grid(gts, ncol=1)
         torchvision.utils.save_image(top_imgs_grid, os.path.join(args.save_path, f"imgs/{plot_idx:03d}.png"))
         torchvision.utils.save_image(fg_masks_grid, os.path.join(args.save_path, f"fg_masks/{plot_idx:03d}.png"))
-        torchvision.utils.save_image(gts_grid, os.path.join(args.save_path, f"gts/{plot_idx:03d}.png"))
+        # torchvision.utils.save_image(gts_grid, os.path.join(args.save_path, f"gts/{plot_idx:03d}.png"))
+        torchvision.utils.save_image(pca3_img_grid, os.path.join(args.save_path, f"pca3/{plot_idx:03d}.png"))
         # coverage_avgs.append(np.array(coverage_counts).mean())
     
     # create_html(args.save_path, args.mode, coverage_avgs)
@@ -225,6 +239,29 @@ def create_html(root, mode, coverage_avgs):
         fh.write(doc.render())
         fh.close()
 
+
+def compute_pca(feats, n_comp, masks=None):
+    pca_in = []
+    for id, x in enumerate(feats):
+        if masks is not None:
+            msk = masks[id].squeeze()
+        else:
+            msk = np.ones(x.shape[0])
+        pca_in.append(x[msk.astype("bool")])
+    pca_in = np.concatenate(pca_in, axis=0)
+    mean = np.mean(pca_in, axis=0, keepdims=True)
+    std = np.std(pca_in, axis=0, keepdims=True)
+    pca_in_normalized = (pca_in - mean) / (std + 1e-5)
+    mat = faiss.PCAMatrix(pca_in.shape(1), n_comp)
+    mat.train(pca_in_normalized)
+    # Transformation applied to all inputs irrespective of masks
+    pca_out = []
+    for x in pca_in:
+        x_norm = (x - mean) / (std + 1e-5)
+        x_tr = mat.apply(x_norm)
+        pca_out.append(x_tr)
+    
+    return pca_out, masks 
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
